@@ -1,5 +1,5 @@
 {
-  "app": "python app.py",
+  "app": "C:/Devl/Python_testing/.venv/Scripts/python.exe app.py",
   "watch": {
     "include": [
       "**"
