@@ -5,10 +5,13 @@ from aws_cdk import (
     # aws_sqs as sqs,
     aws_kms as kms,
     aws_s3 as s3,
+    aws_s3_deployment as s3_deployment,
     aws_opensearchserverless as opensearchserverless,
     aws_bedrock as bedrock,
     aws_iam as iam,
     aws_logs as logs,
+    aws_lambda as _lambda,
+    aws_dynamodb as dynamodb,
     CfnOutput,
 )
 from constructs import Construct
@@ -27,6 +30,25 @@ class PythonTestingStack(Stack):
             encryption_key=kms_key
         )
 
+        # Deploy documents from docs folder to S3 bucket
+        s3_deployment.BucketDeployment(self, "DocsDeployment",
+            sources=[s3_deployment.Source.asset("docs")],
+            destination_bucket=bucket,
+            destination_key_prefix="documents/"
+        )
+
+        # Create DynamoDB table for conversation storage (single table design)
+        conversation_table = dynamodb.Table(self, "ConversationTable",
+            table_name="bedrock-agent-conversations",
+            partition_key=dynamodb.Attribute(name="PK", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="SK", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True
+            ),
+            removal_policy=RemovalPolicy.DESTROY
+        )
+
         # Create an OpenSearch Serverless collection
         collection = opensearchserverless.CfnCollection(self, "MyOpenSearchCollection",
             name="my-opensearch-collection",
@@ -36,10 +58,28 @@ class PythonTestingStack(Stack):
         # Create IAM role for Bedrock Knowledge Base
         bedrock_role = iam.Role(self, "BedrockKnowledgeBaseRole",
             assumed_by=iam.ServicePrincipal("bedrock.amazonaws.com"),
-            managed_policies=[
-                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonBedrockFullAccess"),
-                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonOpenSearchServiceFullAccess"),
-            ]
+            inline_policies={
+                "BedrockPermissions": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=[
+                                "bedrock:*",
+                                "s3:GetObject",
+                                "s3:ListBucket",
+                                "s3:PutObject",
+                                "kms:Decrypt",
+                                "kms:DescribeKey",
+                                "kms:Encrypt",
+                                "kms:GenerateDataKey*",
+                                "kms:ReEncrypt*",
+                                "aoss:*",
+                                "opensearch:*"
+                            ],
+                            resources=["*"]
+                        )
+                    ]
+                )
+            }
         )
 
         # Allow the role to use the KMS key
@@ -87,7 +127,45 @@ class PythonTestingStack(Stack):
             description="S3 data source for ingesting documents into the knowledge base"
         )
 
-        # Create Bedrock Guardrail
+        # Create KB Sync Lambda function
+        kb_sync_role = iam.Role(self, "KbSyncRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            inline_policies={
+                "LambdaBasicExecution": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=[
+                                "logs:CreateLogGroup",
+                                "logs:CreateLogStream",
+                                "logs:PutLogEvents"
+                            ],
+                            resources=[f"arn:aws:logs:{self.region}:{self.account}:*"]
+                        )
+                    ]
+                ),
+                "BedrockSyncPolicy": iam.PolicyDocument(
+                    statements=[
+                        iam.PolicyStatement(
+                            actions=["bedrock:StartIngestionJob"],
+                            resources=[f"arn:aws:bedrock:{self.region}:{self.account}:knowledge-base/{knowledge_base.attr_knowledge_base_id}"]
+                        )
+                    ]
+                )
+            }
+        )
+
+        kb_sync_lambda = _lambda.Function(self, "KbSyncLambda",
+            runtime=_lambda.Runtime.PYTHON_3_9,
+            code=_lambda.Code.from_asset("lambda"),
+            handler="kb_sync.handler",
+            role=kb_sync_role,
+            environment={
+                "DATA_SOURCE_ID": data_source.attr_data_source_id,
+                "KNOWLEDGE_BASE_ID": knowledge_base.attr_knowledge_base_id
+            }
+        )
+
+        # Create Guardrail
         guardrail = bedrock.CfnGuardrail(self, "TestGuardrail",
             name="TestGuardrail",
             description="Guardrail to prevent foul language, PII, PHI, and inappropriate content",
@@ -184,6 +262,10 @@ class PythonTestingStack(Stack):
             description="Alias for invoking the Testbedrockagent"
         )
 
+        # Expose for other stacks
+        self.agent = agent
+        self.agent_alias = agent_alias
+
         # Create CloudWatch Log Group for Agent Logging
         agent_log_group = logs.LogGroup(self, "AgentLogGroup",
             log_group_name="/aws/bedrock/agents/Testbedrockagent",
@@ -194,9 +276,16 @@ class PythonTestingStack(Stack):
         # Outputs
         CfnOutput(self, "KmsKeyArn", value=kms_key.key_arn)
         CfnOutput(self, "S3BucketArn", value=bucket.bucket_arn)
+        CfnOutput(self, "DynamoDBTableName", value=conversation_table.table_name)
+        CfnOutput(self, "DynamoDBTableArn", value=conversation_table.table_arn)
         CfnOutput(self, "OpenSearchCollectionArn", value=collection.attr_arn)
         CfnOutput(self, "KnowledgeBaseId", value=knowledge_base.attr_knowledge_base_id)
+        CfnOutput(self, "KnowledgeBaseName", value="my-knowledge-base")
         CfnOutput(self, "DataSourceId", value=data_source.attr_data_source_id)
+        CfnOutput(self, "GuardrailId", value=guardrail.attr_guardrail_id)
+        CfnOutput(self, "GuardrailArn", value=guardrail.attr_guardrail_arn)
+        CfnOutput(self, "GuardrailVersion", value="DRAFT")
+        CfnOutput(self, "KbSyncLambdaArn", value=kb_sync_lambda.function_arn)
         CfnOutput(self, "AgentId", value=agent.attr_agent_id)
         CfnOutput(self, "AgentAliasId", value=agent_alias.attr_agent_alias_id)
         CfnOutput(self, "AgentLogGroupName", value=agent_log_group.log_group_name)

@@ -4,25 +4,14 @@ import os
 import aws_cdk as cdk
 
 from python_testing.python_testing_stack import PythonTestingStack
+from python_testing.api_gateway_stack import ApiGatewayStack
 
 
 app = cdk.App()
-PythonTestingStack(app, "PythonTestingStack",
-    # If you don't specify 'env', this stack will be environment-agnostic.
-    # Account/Region-dependent features and context lookups will not work,
-    # but a single synthesized template can be deployed anywhere.
-
-    # Uncomment the next line to specialize this stack for the AWS Account
-    # and Region that are implied by the current CLI configuration.
-
-    #env=cdk.Environment(account=os.getenv('CDK_DEFAULT_ACCOUNT'), region=os.getenv('CDK_DEFAULT_REGION')),
-
-    # Uncomment the next line if you know exactly what Account and Region you
-    # want to deploy the stack to. */
-
-    #env=cdk.Environment(account='123456789012', region='us-east-1'),
-
-    # For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html
-    )
+main_stack = PythonTestingStack(app, "PythonTestingStack")
+api_stack = ApiGatewayStack(app, "ApiGatewayStack",
+    agent_id=main_stack.agent.attr_agent_id,
+    agent_alias_id=main_stack.agent_alias.attr_agent_alias_id
+)
 
 app.synth()
